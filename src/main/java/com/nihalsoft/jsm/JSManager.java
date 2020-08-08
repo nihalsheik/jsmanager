@@ -2,16 +2,12 @@ package com.nihalsoft.jsm;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
-import javax.annotation.Resource;
-import javax.annotation.Resources;
-
-import org.reflections.Reflections;
-
-import com.nihalsoft.jsm.annotation.Inject;
+import com.nihalsoft.java.util.Reflection;
 
 public class JSManager {
 
@@ -34,6 +30,14 @@ public class JSManager {
         return instance;
     }
 
+    public static void init(String... pkgs) {
+        JSManager.instance().scan(pkgs);
+    }
+
+    public void scan(String pkg) {
+        this.scan(new String[] { pkg });
+    }
+
     public void scan(String[] pkgs) {
         try {
 
@@ -41,11 +45,11 @@ public class JSManager {
                 System.out.println("No packages to scan");
             }
 
-            Reflections reflections;
+            Reflection reflections;
 
             for (String pkg : pkgs) {
                 _log("Start scanning packages :" + pkg);
-                reflections = new Reflections(pkg);
+                reflections = new Reflection(pkg);
                 _scanResources(reflections);
                 _scanResource(reflections);
             }
@@ -57,51 +61,60 @@ public class JSManager {
         }
     }
 
-    private void _scanResources(Reflections ref) throws Exception {
+    private void _scanResources(Reflection ref) throws Exception {
+
         _log("");
         int i = 0;
-        Set<Class<?>> annotated = ref.getTypesAnnotatedWith(Resources.class);
+
+        List<Class<?>> annotated = ref.getClassesAnnotatedWith(BeanConfiguration.class);
+
         for (Class<?> clazz : annotated) {
+
+            List<Method> methods = ref.getMethodsAnnotatedWith(clazz, Bean.class);
             Object resourceList = clazz.newInstance();
-            _log("Scanning by Resources......" + clazz.getName());
-            Method[] methods = clazz.getDeclaredMethods();
+
             for (Method method : methods) {
-                Resource res = method.getAnnotation(Resource.class);
-                if (res != null) {
-                    _log("Find bean " + res.name() + " - Obect " + clazz.getName());
-                    method.setAccessible(true);
-                    services.put(res.name(), method.invoke(resourceList));
-                    i++;
+                Bean res = method.getAnnotation(Bean.class);
+                if (res == null) {
+                    continue;
                 }
+                _log("Find bean " + res.name() + " - Obect " + clazz.getName());
+                Object obj = method.invoke(resourceList);
+                services.put(res.name().equals("") ? obj.getClass().getName() : res.name(), obj);
+                i++;
             }
+
         }
         _log("Resource list count " + i);
     }
 
-    private void _scanResource(Reflections ref) throws Exception {
+    private void _scanResource(Reflection ref) throws Exception {
         _log("");
         _log("Scanning Resource");
-        Set<Class<?>> annotated = ref.getTypesAnnotatedWith(Resource.class);
-        int i = 0;
-        for (Class<?> clazz : annotated) {
-            _log("Find bean ......" + clazz.getName());
-            services.put(clazz.getName(), clazz.newInstance());
-            i++;
-        }
-        _log("Resource count " + i);
+        List<Class<?>> annotated = ref.getClassesAnnotatedWith(Bean.class);
+        annotated.forEach(clazz -> this._addBean(clazz));
+        _log("Resource count " + annotated.size());
     }
 
-    public Object createBean(Class<?> klass) throws Exception {
-        Object instance = klass.newInstance();
-        _injectClass(instance);
-        return instance;
+    public <T> T getInstance(Class<T> klass) throws Exception {
+        T ins = klass.newInstance();
+        _injectClass(ins);
+        return ins;
+    }
+
+    public Object getInstance(Object obj) throws Exception {
+        _injectClass(obj);
+        return obj;
     }
 
     private void _inject() {
-        services.forEach((k, ins) -> this._injectClass(ins));
+
+        services.forEach((k, ins) -> this._injectField(ins));
+        services.forEach((k, ins) -> this._injectSetter(ins));
+
         services.forEach((k, ins) -> {
             try {
-                Method method = ins.getClass().getMethod("postConstruct");
+                Method method = ins.getClass().getMethod("$postConstruct");
                 method.invoke(ins);
             } catch (Exception e) {
 
@@ -110,7 +123,11 @@ public class JSManager {
     }
 
     private void _injectClass(Object object) {
+        _injectField(object);
+        _injectSetter(object);
+    }
 
+    private void _injectField(Object object) {
         String className = object.getClass().getName();
 
         Field[] fields = object.getClass().getDeclaredFields();
@@ -132,18 +149,54 @@ public class JSManager {
             }
         }
 
-        _log("---------------------");
-
     }
 
-    public JSManager addBean(Class<?> klass) {
-        try {
-            services.put(klass.getName(), klass.newInstance());
-            _inject();
-        } catch (Exception e) {
-            e.printStackTrace();
+    private void _injectSetter(Object object) {
+        _log("Injecting Setter");
+
+        Method[] methods = object.getClass().getMethods();
+        for (Method method : methods) {
+            Inject inj = method.getAnnotation(Inject.class);
+            if (inj == null) {
+                continue;
+            }
+            try {
+                _log("Injecting setter - method " + method.getName());
+                Object[] args = new Object[method.getParameterCount()];
+                int i = 0;
+                for (Parameter p : method.getParameters()) {
+                    Inject pann = p.getAnnotation(Inject.class);
+                    String name = "";
+                    if (pann != null && !pann.value().equals("")) {
+                        name = pann.value();
+                    } else {
+                        name = p.getType().getName();
+                    }
+                    _log("P name -->" + name);
+                    args[i++] = this.get(name);
+                }
+                _log("Injecting setter - invokind");
+                method.invoke(object, args);
+
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
         }
-        return this;
+    }
+
+    public <T> T addBean(Class<T> clazz) {
+        T ins = this._addBean(clazz);
+        _inject();
+        return ins;
+    }
+
+    public <T> T addBean(Class<T> clazz, boolean attachToContainer) throws Exception {
+        if (attachToContainer) {
+            return this.addBean(clazz);
+        }
+        T ins = clazz.newInstance();
+        _injectClass(ins);
+        return ins;
     }
 
     public JSManager addBean(String name, Object object) {
@@ -167,7 +220,32 @@ public class JSManager {
         return (T) services.get(clazz.getName());
     }
 
+    public <T> T _addBean(Class<T> clazz) {
+        T ins = null;
+        try {
+            Bean bean = clazz.getAnnotation(Bean.class);
+            _log("Find bean ......" + clazz.getName() + " constructor length : " + clazz.getConstructors().length);
+
+            ins = clazz.newInstance();
+
+            services.put(bean.name().equals("") ? clazz.getName() : bean.name(), ins);
+
+            Class<?>[] interfaces = clazz.getInterfaces();
+            for (Class<?> iface : interfaces) {
+                _log("Interface -------------------> " + iface.getName());
+                if (!services.containsKey(iface.getName())) {
+                    services.put(iface.getName(), ins);
+                }
+            }
+
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+
+        return ins;
+    }
+
     private void _log(String msg) {
-        System.out.println(" ----> " + msg);
+        System.out.println(" -------| " + msg);
     }
 }
